@@ -1,0 +1,446 @@
+#-----------------------
+# Clear Environment ####
+#-----------------------
+
+rm(list=ls())
+
+# = = = = = = = = = = = = =
+# 1.0 Import Packages ####
+#= = = = = = = = = = = = =
+library(readxl)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(reshape2)
+library(odbc)
+library(sqldf)
+
+# = = = = = = = = = = = = = =
+# 2.0 Define Parameters ####
+#= = = = = = = = = = = = = =
+startDate <- ymd('2014-01-01')
+endDate <- ymd('2019-06-07')
+options(scipen = 999) # disable scientific notation
+# schemeList <- c('G1303','G1304','G1188','G0316') # NABGSF
+
+# SPS250 schemes ( ** CHECK IF NULIS IS REQUIRED **)
+#schemeList <- c('G3361','G3399','G3348','G3434','G1160','G1162','G1161','G1163','G3331','G3432','G3201','G3284','G3285','G3286','G3287','G3340','G3345','G3218','G3219','G3112','G3461','G2935','G2986','G3439','G1140','G1141','G0721','G3502','G3484','G3485','G3486','G3487','G3488','G3489','G3490','G3495','G3496','G3600','G3608','G3431','G3410','G3375','G0389','G0387','G3149','G3148','G3421','G3330')
+
+#schemeList <- c('G0387','G0389','G3375','G3431','4584892','G1065','1050649','4663321','G1261','G1260','4665234','1010597','G0503','G1131','G3179','G3180','4832500','4804590','4804592')
+
+# = = = = = = = = = = =
+# 3.0 Data Import ####
+#= = = = = = = = = = =
+# - - - - - - - - - - - - - - - - -
+# 3.1 Import Raw Source Files ####
+#- - - - - - - - - - - - - - - - -
+ocr <- read_csv('inputs/OCR 2019-06-07.csv', skip = 3, guess_max = 1000000)
+ccr <- read_csv('inputs/CCR 1900-01-01 to 2019-06-07.csv', skip = 4, guess_max = 1000000)
+cpr <- read_csv('inputs/CPR 1900-01-01 to 2019-06-07.csv', skip = 7, guess_max = 1000000)
+oldOCR <- read_csv('inputs/oldOCR 2014-01-01 to 2019-06-07.csv', guess_max = 1000000)
+
+# - - - - - - - - - - - - -
+# 3.2 Import Mappings ####
+#- - - - - - - - - - - - -
+claimTypeMapping <- read_xlsx('inputs/mapping.xlsx', sheet = 'groupClaimType')
+groupSubmetric <- read_xlsx('inputs/mapping.xlsx', sheet = 'groupSubmetric')
+
+# = = = = = = = = = = = =
+# 4.0 File Cleaning ####
+#= = = = = = = = = = = =
+# - - - - - - - - - - -
+# 4.1 Cleaning CCR ####
+#- - - - - - - - - - -
+# change column names
+ccr <- ccr %>%
+  rename('Amount Paid' = 'Total Gross Payment') %>% 
+  rename_all(., funs(str_remove_all(., '\\s')))
+
+# only keep relevant schemes
+#ccr <- ccr %>% 
+  #filter(PolicyNumber %in% schemeList)
+
+# only keep relevant columns
+ccr <- ccr %>% 
+  select(-one_of('Product', 'PayFromSource'))
+
+# join claim type mapping
+ccr <- ccr %>%
+  left_join(claimTypeMapping, by = c('ClaimType')) %>%
+  select(-one_of('ClaimType')) %>%
+  rename('ClaimType' = 'APRAclaimType')
+
+# format dates
+ccr <- ccr %>%
+  mutate_at(vars('DateofBirth', 'DateofClaim', 'DateNotified', 'DecisionDate', 'FinalisedDate'),
+            funs(dmy))
+
+# remove finalisation dates outside range
+ccr <- ccr %>%
+  filter(FinalisedDate < ymd(endDate))
+
+# identify and remove duplicate CCR records (parent and child of duplicates removed)
+ccr <- ccr %>%
+  group_by(MemberNumber, ClaimType) %>%
+  filter(n() == 1) %>%
+  ungroup()
+
+# set SI for DII to be monthly
+ccr <- ccr %>%
+  mutate(InsuredAmount = case_when(ClaimType == 'DII' ~ InsuredAmount / 12,
+                                TRUE ~ InsuredAmount))
+
+# - - - - - - - - - - -
+# 4.2 Cleaning CPR ####
+#- - - - - - - - - - -
+# change column names
+cpr <- cpr %>%
+  rename_all(., funs(str_remove_all(., '\\s')))
+
+# only keep relevant schemes
+#cpr <- cpr %>% 
+  #filter(SchemeNumber %in% schemeList)
+
+# join claim type mapping
+cpr <- cpr %>%
+  left_join(claimTypeMapping, by = c('PaymentType' = 'ClaimType')) %>%
+  select(-one_of('PaymentType')) %>%
+  rename('ClaimType' = 'APRAclaimType')
+
+# format dates
+cpr <- cpr %>%
+  mutate_at(vars('ProcessedDate', 'PaymentStartDate', 'PaymentEndDate'),
+            funs(dmy))
+
+# format member number
+cpr <- cpr %>% 
+  mutate_at(vars('MemberNumber'),
+            funs(as.integer))
+
+# remove payment dates outside range
+cpr <- cpr %>%
+  filter(ProcessedDate < ymd(endDate))
+
+# consolidate payments
+cpr <- cpr %>%
+  group_by(MemberNumber, ClaimType) %>%
+  mutate(GrossPaymentAmount = sum(GrossPaymentAmount),
+         FirstProcessedDate = min(ProcessedDate),
+         LastProcessedDate = max(ProcessedDate),
+         FirstEffPaymentDate = min(PaymentStartDate),
+         LastEffPaymentDate = max(PaymentEndDate),
+         MultiplePayments = case_when(n() == 1 ~ FALSE,
+                                         TRUE ~ TRUE)) %>%
+  distinct(MemberNumber, ClaimType, .keep_all = TRUE) %>%
+  select(MemberNumber, ClaimType, GrossPaymentAmount, ProcessedDate, FirstEffPaymentDate, LastEffPaymentDate, MultiplePayments) %>% 
+  ungroup()
+
+# - - - - - - - - - -
+# 4.3 Clean OCR ####
+#- - - - - - - - - -
+# change column names
+ocr <- ocr %>%
+  rename_all(., funs(str_remove_all(., '\\s')))
+
+# only keep relevant columns
+ocr <- ocr %>%
+  select(SchemeNumber, SchemeName, MemberNumber, ClaimType, FirstName, LastName, DateOfBirth, Gender, DateJoinedFund, OccupationClass,
+         HazardousOccupation, DateIncurred, WaitingPeriod, GSCBenefitPeriod, EndofBenefitPeriod, ExpectedClosureDate, `MonthlySumInsured(GSC)`,
+         DeathSumAssured, TPDSumAssured, TraumaSumAssured, SourceofClaim, DateNotifiedofClaim, `GSIndexation/Escalation`, PossibleReopenedClaim,
+         reportrundate)
+
+# only keep relevant schemes
+#ocr <- ocr %>% 
+  #filter(SchemeNumber %in% schemeList)
+
+# remove records whith first/last name of variation 'DO NOT USE'
+doNotUse = c('not', 'use', 'bulk member 1', 'bulk', 'member', 'do not', 'do not use','not use')
+ocr <- ocr %>%
+  mutate(FirstName = tolower(FirstName),
+         LastName = tolower(LastName)) %>%
+  filter(!FirstName %in% doNotUse & !LastName %in% doNotUse)
+rm(doNotUse)
+
+# join claim type mapping
+ocr <- ocr %>%
+  left_join(claimTypeMapping, by = c('ClaimType')) %>%
+  select(-one_of('ClaimType')) %>%
+  rename('ClaimType' = 'APRAclaimType')
+
+# combine SumInsured
+ocr <- ocr %>% 
+  mutate(SumInsured = case_when(ClaimType == 'DII' ~ as.double(`MonthlySumInsured(GSC)`),
+                                ClaimType == 'Death with TI' ~ as.double(DeathSumAssured),
+                                ClaimType == 'TI' ~ as.double(DeathSumAssured),
+                                ClaimType == 'TPD' ~ as.double(TPDSumAssured),
+                                ClaimType == 'Trauma' ~ as.double(TraumaSumAssured),
+                                TRUE ~ as.double(0))) %>% 
+  select(-one_of('DeathSumAssured', 'TPDSumAssured', 'TraumaSumAssured', 'MonthlySumInsured(GSC)'))
+
+# format dates
+ocr <- ocr %>%
+  mutate_at(vars('DateOfBirth', 'DateJoinedFund', 'DateIncurred', 'EndofBenefitPeriod', 'ExpectedClosureDate',
+                 'DateNotifiedofClaim', 'reportrundate'),
+            funs(dmy))
+
+# add open flag
+ocr <- ocr %>%
+  mutate(openFlag = TRUE)
+
+# remove dates outside range
+ocr <- ocr %>%
+  filter(reportrundate >= ymd(startDate) & reportrundate <= ymd(endDate+1))
+
+# - - - - - - - - - - - -
+# 4.3 Clean old OCR ####
+#- - - - - - - - - - - -
+# change column names
+oldOCR <- oldOCR %>%
+  rename_all(., funs(str_remove_all(., '\\s')))
+
+# only keep relevant columns
+oldOCR <- oldOCR %>%
+  select(SchemeNumber, SchemeName, MemberNumber, ClaimType, FirstName, LastName, DateOfBirth, Gender, DateJoinedFund, OccupationClass,
+         HazardousOccupation, DateIncurred, WaitingPeriod, GSCBenefitPeriod, EndofBenefitPeriod, ExpectedClosureDate, `AnnualSumInsured(GSC)`,
+         DeathSumInsured, TraumaSumInsured, SourceofClaim, DateNotifiedofClaim, `GSIndexation/Escalation`, PossibleReopenedClaim)
+
+# only keep relevant schemes
+#oldOCR <- oldOCR %>% 
+  #filter(SchemeNumber %in% schemeList)
+
+# combine SumInsured
+oldOCR <- oldOCR %>% 
+  mutate(SumInsured = case_when(ClaimType == 'DII' ~ as.double(`AnnualSumInsured(GSC)` / 12),
+                                ClaimType == 'Death with TI' ~ as.double(DeathSumInsured),
+                                ClaimType == 'TI' ~ as.double(DeathSumInsured),
+                                ClaimType == 'Trauma' ~ as.double(TraumaSumInsured),
+                                TRUE ~ as.double(0))) %>% 
+  select(-one_of('DeathSumInsured', 'TraumaSumInsured', 'AnnualSumInsured(GSC)'))
+
+# format dates
+oldOCR <- oldOCR %>%
+  mutate_at(vars('DateJoinedFund', 'EndofBenefitPeriod', 'ExpectedClosureDate'),
+            funs(dmy))
+
+# - - - - - - - - - - - - - -
+# 4.4 Save Cleaned Files ####
+#- - - - - - - - - - - - - -
+write_csv(ocr, 'outputs/clean OCR.csv', na = '')
+write_csv(ccr, 'outputs/clean CCR.csv', na = '')
+write_csv(cpr, 'outputs/clean CPR.csv', na = '')
+write_csv(oldOCR, 'outputs/clean OCR.csv', na = '')
+
+# = = = = = = = = = = = = = = = = = =
+# 5.0 File Merging + Processing ####
+#= = = = = = = = = = = = = = = = = =
+# take a copy of clean OCR
+ocr.clean <- ocr
+
+# - - - - - - - - - - - - - -
+# 5.1 Merge with oldOCR ####
+#- - - - - - - - - - - - - -
+# get distict list
+oldOCR <- oldOCR %>% 
+  #filter(SchemeNumber %in% schemeList) %>% 
+  distinct(MemberNumber, ClaimType, .keep_all = TRUE)
+
+# compare
+missing <- oldOCR %>% 
+  anti_join(ocr.clean, by = c('MemberNumber', 'ClaimType'))
+
+# merge OCR with missing entries from oldOCR
+ocr.clean <- ocr.clean %>% 
+  bind_rows(missing)
+
+# - - - - - - - - - - - - - - - - -
+# 5.2 Merge with Cleaned Files ####
+#- - - - - - - - - - - - - - - - -
+# merge OCR with CCR
+ocr.clean <- ocr.clean %>%
+  full_join(ccr, by = c('MemberNumber', 'ClaimType'))
+
+# merge OCR with CPR
+ocr.clean <- ocr.clean %>%
+  left_join(cpr, by = c('MemberNumber', 'ClaimType'))
+
+# - - - - - - - - - - - - - - - - - - - - - - - -
+# 5.3 Coalesce Common Columns from full_join ####
+#- - - - - - - - - - - - - - - - - - - - - - - -
+ocr.clean <- ocr.clean %>%
+  mutate(Gender.x = coalesce(Gender.x, Gender.y),
+         SchemeNumber = coalesce(SchemeNumber, PolicyNumber),
+         SchemeName = coalesce(SchemeName, PolicyName),
+         Name = case_when(is.na(FirstName) ~ CustomerName,
+                          TRUE ~ paste0(FirstName, ', ', LastName)),
+         DateOfBirth = coalesce(DateOfBirth, DateofBirth),
+         CauseofClaim = coalesce(SourceofClaim, CauseofClaim),
+         SumInsured = coalesce(InsuredAmount, SumInsured),
+         DateofClaim = coalesce(DateIncurred, DateofClaim),
+         DateNotified = coalesce(DateNotifiedofClaim, DateNotified),
+         AmountPaid = pmax(GrossPaymentAmount, AmountPaid, na.rm = TRUE)) %>% 
+  select(-one_of('Gender.y', 'PolicyNumber', 'PolicyName', 'FirstName', 'LastName', 'CustomerName', 'DateofBirth', 'SourceofClaim',
+                 'InsuredAmount', 'DateIncurred', 'DateNotifiedofClaim', 'GrossPaymentAmount')) %>% 
+  rename('Gender' = 'Gender.x')
+
+# - - - - - - - - - - - - - - - - - - - -
+# 5.3 Join in oldOCR for Extra Data ####
+#- - - - - - - - - - - - - - - - - - - -
+# only keep fields for which data will be missing
+oldOCR2 <- oldOCR %>%
+  select(MemberNumber, ClaimType, DateJoinedFund, OccupationClass, HazardousOccupation, WaitingPeriod,
+         GSCBenefitPeriod, EndofBenefitPeriod, ExpectedClosureDate, `GSIndexation/Escalation`,
+         PossibleReopenedClaim)
+
+# enrich missing fields (from CCR) with fields in oldOCR
+ocr.clean <- ocr.clean %>% 
+  left_join(oldOCR2, by = c('MemberNumber', 'ClaimType'))
+
+ocr.clean <- ocr.clean %>%
+  mutate(DateJoinedFund.x = coalesce(DateJoinedFund.x, DateJoinedFund.y),
+         OccupationClass.x = coalesce(OccupationClass.x, OccupationClass.y),
+         HazardousOccupation.x = coalesce(HazardousOccupation.x, HazardousOccupation.y),
+         WaitingPeriod.x = coalesce(WaitingPeriod.x, WaitingPeriod.y),
+         GSCBenefitPeriod.x = coalesce(GSCBenefitPeriod.x, GSCBenefitPeriod.y),
+         EndofBenefitPeriod.x = coalesce(EndofBenefitPeriod.x, EndofBenefitPeriod.y),
+         ExpectedClosureDate.x = coalesce(ExpectedClosureDate.x, ExpectedClosureDate.y),
+         `GSIndexation/Escalation.x` = coalesce(`GSIndexation/Escalation.x`, `GSIndexation/Escalation.y`),
+         PossibleReopenedClaim.x = coalesce(PossibleReopenedClaim.x, PossibleReopenedClaim.y)) %>% 
+  select(-contains('.y')) %>% 
+  rename_all(., funs(str_remove_all(., '\\.x$')))
+
+# - - - - - - - - - - - - - - - - - - - -
+# 5.4 Exclude Claims Set Up In Error ####
+#- - - - - - - - - - - - - - - - - - - -
+ocr.clean <- ocr.clean %>%
+  filter(is.na(ReasonforClosure) | ReasonforClosure != 'Set up in error')
+
+# - - - - - - - - - - - -
+# 5.5 Join subMetric ####
+#- - - - - - - - - - - -
+# set blanks/NA's as character('NA') for seamless merging
+ocr.clean <- ocr.clean %>%
+  mutate(ReasonforClosure = case_when(is.na(ReasonforClosure) | ReasonforClosure == '' ~ 'NA',
+                                          TRUE ~ ReasonforClosure),
+         Decision = case_when(is.na(Decision) | Decision == '' ~ 'NA',
+                                TRUE ~ Decision))
+
+groupSubmetric <- groupSubmetric %>%
+  mutate(ReasonforClosure = case_when(is.na(ReasonforClosure) ~ 'NA',
+                                          TRUE ~ ReasonforClosure),
+         Decision = case_when(is.na(Decision) ~ 'NA',
+                                TRUE ~ Decision))
+
+# merge in mapping to get APRA claim classification
+ocr.clean <- ocr.clean %>%
+  left_join(groupSubmetric, by = c('ClaimType' = 'APRAclaimType', 'Decision', 'ReasonforClosure'))
+
+# remove excluded claims from mapping
+ocr.clean <- ocr.clean %>% 
+  filter(!is.na(Outcome) | Outcome != 'Exclude')
+
+# = = = = = = = = = = = = = = =
+# 6.0 Augment with RC Data ####
+#= = = = = = = = = = = = = = =
+# open database connection
+con <- dbConnect(odbc(),
+                 .connection_string='driver={SQL Server};server=ARP01DLDVDB01, 51588;database=IKW_PRS;trusted_connection=true')
+
+
+# read FSRC data
+rc <- dbReadTable(con, 'rpt_ClaimAnalytic_rc_group')
+
+# only keep relevant fields
+rc <- rc %>% 
+  select(member_number, claim_type, date_of_event, date_notified, date_of_decision, status_off, sum_insured)
+
+# adjust status_off column
+rc <- rc %>% 
+  mutate(status_off = case_when(grepl('decline|settle', status_off, ignore.case = TRUE) ~ 'Decline',
+                                grepl('withdra', status_off, ignore.case = TRUE) ~ 'Withdraw',
+                                grepl('Undetermine', status_off, ignore.case = TRUE) ~ as.character(NA), # undetermined may have been determined since
+                                grepl('admit', status_off, ignore.case = TRUE) ~ 'Admit',
+                                TRUE ~ status_off))
+
+# join to ocr.clean
+ocr.clean <- ocr.clean %>% 
+  left_join(rc, by = c('MemberNumber' = 'member_number', 'ClaimType' = 'claim_type'))
+
+# clean up
+ocr.clean <- ocr.clean %>% 
+  mutate_at(vars('date_of_event', 'date_notified', 'date_of_decision'),
+            funs(ymd)) %>% 
+  mutate(DateofClaim = coalesce(date_of_event, DateofClaim),
+         DateNotified = coalesce(date_notified, DateNotified),
+         DecisionDate = coalesce(date_of_decision, DecisionDate),
+         SumInsured = coalesce(sum_insured, SumInsured),
+         Outcome = coalesce(status_off, Outcome)) %>% 
+  select(-c(date_of_event, date_notified, date_of_decision, status_off, sum_insured))
+
+# = = = = = = = = = = = = = = = =
+# 7.0 Augment with APRA Data ####
+#= = = = = = = = = = = = = = = =
+# import
+APRA <- read_xlsx('inputs/APRA Subs.xlsx', sheet = 'Sheet1')
+
+# remove Undetermined APRA outcomes (as they're now outdated)
+APRA <- APRA %>% 
+  mutate(status.off = case_when(status.off == 'Undetermined' ~ as.character(NA),
+                                TRUE ~ status.off))
+
+# left join
+ocr.clean <- ocr.clean %>% 
+  left_join(APRA, by = c('MemberNumber', 'ClaimType'))
+
+# clean up
+ocr.clean <- ocr.clean %>% 
+  mutate_at(vars('DateIncurred', 'DateNotified.y', 'DecisionDate.y'),
+            funs(ymd)) %>% 
+  mutate(DateofClaim = coalesce(DateIncurred, DateofClaim),
+         DateNotified.x = coalesce(DateNotified.y, DateNotified.x),
+         DecisionDate.x = coalesce(DecisionDate.y, DecisionDate.x),
+         AmountPaid.x = pmax(AmountPaid.y, AmountPaid.x, na.rm = TRUE),
+         SumInsured.x = coalesce(SumInsured.y, SumInsured.x),
+         Outcome = coalesce(status.off, Outcome)) %>% 
+  select(-one_of('DateIncurred', 'DateNotified.y', 'DecisionDate.y', 'AmountPaid.y', 'SumInsured.y', 'status.off')) %>% 
+  rename('DateNotified' = 'DateNotified.x', 'DecisionDate' = 'DecisionDate.x', 'AmountPaid' = 'AmountPaid.x',
+         'SumInsured' = 'SumInsured.x')
+
+# Enhance dataset with P2R3
+p2r3 <- read_csv('inputs/APRA/P2R3 - Group - with LCCC exceptions_2.csv', guess_max = 100000)
+p2r3_clean <- p2r3 %>%
+  mutate(`Claim Type` = gsub('-Any|-Own|-Other|-Personal', '', `Claim Type`),
+         `Claim Type` = case_when(`Claim Type` == 'Death' ~ 'Death with TI',
+                                  TRUE ~ `Claim Type`),
+         Outcome = case_when(grepl('admitted \\(excluding', ClaimStatus) ~ 'Admit',
+                             grepl('contractual|exclusion|eligibility|innocent|fraud|settlement|gratia|decline', ClaimStatus, ignore.case=T) ~ 'Decline',
+                             grepl('withdraw', ClaimStatus, ignore.case=T) ~ 'Withdraw',
+                             grepl('undetermined', ClaimStatus, ignore.case = T) ~ NA_character_,
+                             TRUE ~ ClaimStatus)) %>% 
+  select(`Member Number`, `Claim Type`, DateOfEvent, DateNotified, DecisionDate, AmountPaid, SumInsured, Outcome) %>% 
+  rename_all(~str_remove_all(., '\\s')) %>% 
+  rename_at(vars(-c('MemberNumber', 'ClaimType')), ~ paste0(., '_p2r3'))
+
+ocr.clean <- ocr.clean %>% 
+  # force data type to match for join
+  mutate_at(vars('MemberNumber'), funs(as.character)) %>% 
+  left_join(p2r3_clean, by=c('MemberNumber', 'ClaimType')) %>% 
+  mutate(DateofClaim = coalesce(DateOfEvent_p2r3, DateofClaim),
+         DateNotified = coalesce(DateNotified_p2r3, DateNotified),
+         DecisionDate = coalesce(DecisionDate_p2r3, DecisionDate),
+         AmountPaid = pmax(AmountPaid_p2r3, AmountPaid, na.rm = T),
+         Outcome = coalesce(Outcome_p2r3, Outcome)) %>% 
+  select(-ends_with('_p2r3'))
+
+# = = = = = = = = = =
+# 8.0 Clean Up ####
+#= = = = = = = = = =
+ocr.clean <- ocr.clean %>% 
+  # set 'simple' status
+  mutate(Status = case_when(openFlag == TRUE ~ 'Open',
+                            TRUE ~ 'Closed')) %>% 
+  select(-openFlag)
+
+# save R object for import into spreadsheet population script
+saveRDS(ocr.clean, 'outputs/ocr.clean.rds')
+write_csv(ocr.clean, 'outputs/ocr.clean.csv', na = '')
+
